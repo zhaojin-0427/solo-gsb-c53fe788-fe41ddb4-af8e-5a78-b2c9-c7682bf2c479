@@ -11,18 +11,27 @@
 
 * 两版区域的全部真实属主、通配符父节点、空非终结点都作为标记；
 * DNAME 目标子树的结构点通过拉回（preimage）闭包映射回源侧，
-  因此 DNAME 目标变化影响到的未列名也会被覆盖；闭包**按实际跳数
-  有限化**（深度上限 ``MAX_ALIAS_HOPS - 1``）：一次拉回对应正向解析的
-  一跳 DNAME 改写，像 ``x.d DNAME d`` 这类自引用规则只生成有限个
-  x.d / x.x.d / … 标记，不会无限增长，且边界与解析器一致——31 跳仍可
-  见末端变化，32 跳触顶（alias_chain_limit）后两版应答相同；
-* trie 上每个标记节点的直接下级空隙用 ``w-*``（一标签）与
-  ``ww-*``（多层）两个虚拟标签代表。
+  因此 DNAME 目标变化影响到的未列名也会被覆盖；闭包受**两重**有限化：
+  一次拉回对应正向解析的一跳 DNAME 改写，故按实际跳数限深
+  （深度上限 ``MAX_ALIAS_HOPS - 1``），像 ``x.d DNAME d`` 这类自引用
+  规则只生成有限个 x.d / x.x.d / … 标记；同时拉回产物必须是**合法
+  DNS 名**（线格式不超过 255 字节）——DNAME 属主标签可达 63 字节，
+  自引用规则每跳增加一个长标签，超过线长余量的反向标记一律不生成，
+  它们对应“任何 DNS 报文都发不出去”的查询，不可能是合法见证；
+* trie 上每个标记节点的直接下级空隙用一标签 / 两标签两个虚拟新鲜
+  探针代表。探针标签按该节点的**线长余量**从全局最短新鲜标签池里
+  分配：余量大时沿用 ``w-i`` / ``ww-i`` 风格；余量只容得下短标签时
+  改取最短的新鲜标签（如 ``0``），保证“标记仍容得下短标签、却容不
+  下常规虚拟标签”的空隙仍有合法见证；连一个标签都放不下（名字已到
+  254/255 字节）时该空隙等价类本身为空，不建单元。名称永不截断。
 
 输出模式形如 ``锥 − 排除子树列表``，同类型的模式互斥且并集覆盖全区域。
 """
 from __future__ import annotations
 
+import heapq
+import itertools
+import string
 from dataclasses import dataclass, field
 
 import dns.name
@@ -31,13 +40,43 @@ import dns.rdatatype
 from .zone import ParsedZone
 from .resolver import Resolver, Answer, MAX_ALIAS_HOPS
 
+# 一个完整域名（绝对名）的线格式上限：255 字节（RFC 1035）。
+MAX_NAME_WIRE = 255
+
 # 反向拉回（preimage）的最大深度：一次拉回对应正向解析里的一跳 DNAME
 # 改写。解析器在第 MAX_ALIAS_HOPS 跳处以 alias_chain_limit 终止，末端
 # 数据不再可见；因此只需把“经不超过 MAX_ALIAS_HOPS-1 跳改写即可到达
-# 末端结构点”的源侧名称拉成显式标记。再深的名称两版都在跳数上限处
+# 末端结构点”的源侧名称拉成显式标记。再深的名字两版都在跳数上限处
 # 终止，其变化判定由既有探针空隙承载——这与 /resolve 的逐跳结果一致：
 # 31 层 x 仍能看到目标变化，32 层触顶后两版应答相同。
+# 对 63 字节的长标签 DNAME 属主，线长上限会比跳数上限更早到达，届时
+# 由线长检查截断（见 build_markers）：超长名在 DNS 里根本无法查询，
+# 既不能当标记也不能当见证。
 MAX_PREIMAGE_DEPTH = MAX_ALIAS_HOPS - 1
+
+
+# ---------------------------------------------------------------------------
+# 线长工具
+# ---------------------------------------------------------------------------
+
+def _label_wire(lb: str) -> int:
+    return len(lb.encode("ascii", "strict")) + 1
+
+
+def _rel_wire(labels: tuple[str, ...]) -> int:
+    """相对标签序列拼回绝对名后占用的线字节数（不含根 0 字节）。"""
+    return sum(_label_wire(lb) for lb in labels)
+
+
+def _abs_wire(labels: tuple[str, ...], origin: dns.name.Name) -> int:
+    """labels 相对 origin 拼回绝对名后的完整线格式长度（含根 0 字节）。"""
+    return _rel_wire(labels) + len(origin.to_wire())
+
+
+def _wire_room(labels: tuple[str, ...], origin: dns.name.Name) -> int:
+    """该节点名下还能再放多少线字节（新增标签 = 标签长 + 1）。"""
+    return MAX_NAME_WIRE - _abs_wire(labels, origin)
+
 
 # ---------------------------------------------------------------------------
 # 锥与模式
@@ -91,7 +130,127 @@ def rel_labels(name: dns.name.Name, origin: dns.name.Name) -> tuple[str, ...]:
 def abs_name(labels: tuple[str, ...], origin: dns.name.Name) -> dns.name.Name:
     if not labels:
         return origin
+    # 调用方只应为合法（线长 ≤255）的探针名调用；这里若仍超限说明闭包 /
+    # 单元构建的线长余量计算有误，直接作为程序错误抛出而非静默截断。
+    if _abs_wire(labels, origin) > MAX_NAME_WIRE:
+        raise dns.name.NameTooLong(
+            f"内部探针名超过 {MAX_NAME_WIRE} 字节线格式上限，"
+            "该空隙不应构建探针"
+        )
     return dns.name.from_text(".".join(labels), origin=origin)
+
+
+# ---------------------------------------------------------------------------
+# 虚拟新鲜标签池
+# ---------------------------------------------------------------------------
+
+# 单标签线长上限 63 字节（1 长度字节 + 63 内容字节）。
+_MAX_LABEL_LEN = 63
+_FRESH_ALPHABET = string.digits + string.ascii_lowercase
+
+
+def _short_labels():
+    """最短新鲜标签序列：仅字母数字，按 (线长, 文本) 无限枚举。"""
+    for n in itertools.count(1):
+        if n > _MAX_LABEL_LEN:
+            return
+        for tup in itertools.product(_FRESH_ALPHABET, repeat=n):
+            yield "".join(tup)
+
+
+def _wide_labels():
+    """常规 ``w-i`` / ``ww-i`` 风格虚拟标签序列，同样按 (线长, 文本)。"""
+    for i in itertools.count():
+        yield f"w-{i}"
+        yield f"ww-{i}"
+
+
+class FreshPool:
+    """全局新鲜标签分配器。
+
+    维护两族标签流：
+
+    * **短标签**（``0``、``1``…字母数字名）——为线长余量极紧、放不下
+      常规 ``w-i`` 风格标签的节点保留；
+    * **宽标签**（``w-i`` / ``ww-i``）——余量充裕的节点使用，输出可读
+      且与历史实现的探针命名保持一致。
+
+    两族内部都按 ``(线长, 文本)`` 枚举；凡出现在两版区域真实标签里、
+    字面 ``*`` 或已经被分配出去的标签都会被跳过（短/宽流共享同一占用
+    集合），因此拿到的标签必为“未列名”，探针不会撞上真实属主。
+
+    分配按节点线长余量**从紧到松**，每个节点先试探能否用一对宽标签
+    同时放下 star 与 deep 两个探针（:meth:`take_wide_preferred`）；若
+    宽 star 撑不下两层，就归还（:meth:`release`）并改用最短的短标签
+    （:meth:`take_short_only`）——余量充裕的节点得到可读的
+    ``w-i``/``ww-i``，只剩 2~3 字节的节点得到 ``0`` 之类一字符标签。
+    """
+
+    def __init__(self, forbidden: set[str]):
+        self._used: set[str] = set(forbidden)
+        self._used.add("*")
+        self._streams = [iter(_short_labels()), iter(_wide_labels())]
+        self._heaps: list[list[tuple[int, str]]] = [[], []]
+        # 每个由本池取走的标签来自哪条流（release 时据此放回对应堆）。
+        self._origin: dict[str, int] = {}
+        for idx, it in enumerate(self._streams):
+            self._advance(idx, it)
+
+    def _advance(self, idx: int, it):
+        try:
+            lb = next(it)
+        except StopIteration:
+            return
+        heapq.heappush(self._heaps[idx], (_label_wire(lb), lb))
+
+    def _peek(self, idx: int):
+        return self._heaps[idx][0] if self._heaps[idx] else None
+
+    def _pop(self, idx: int) -> str:
+        _wlen, lb = heapq.heappop(self._heaps[idx])
+        self._advance(idx, self._streams[idx])
+        return lb
+
+    def _take_from(self, idx: int, max_wire: int) -> str | None:
+        """从单条流里取一个线长 ≤ max_wire 的新鲜标签；放不下返回 None。"""
+        while True:
+            top = self._peek(idx)
+            if top is None:
+                return None
+            wlen, lb = top
+            if wlen > max_wire:
+                return None
+            self._pop(idx)
+            if lb in self._used:
+                continue
+            self._used.add(lb)
+            self._origin[lb] = idx
+            return lb
+
+    def take_short_only(self, max_wire: int) -> str | None:
+        return self._take_from(0, max_wire)
+
+    def take_wide_preferred(self, max_wire: int) -> str | None:
+        # 严格优先宽标签：能放下任一宽标签就用宽的；只有余量连最短宽
+        # 标签都放不下时才回落到短标签（此节点理应已在 tight 阶段处理，
+        # 回落是双标签场景下第二标签的防御路径）。
+        got = self._take_from(1, max_wire)
+        if got is not None:
+            return got
+        return self._take_from(0, max_wire)
+
+    def release(self, labels: list[str]) -> None:
+        """归还一次试探性分配中已取走、最终不采用的标签。
+
+        标签立即恢复为未占用并重新放回对应标签流的候选堆，因此随后的
+        分配仍能拿到这些（最短的）名字——试探性的方案 A 失败不会“烧掉”
+        本该属于方案 B 的短标签。
+        """
+        for lb in labels:
+            self._used.discard(lb)
+            heapq.heappush(
+                self._heaps[self._origin.pop(lb)], (_label_wire(lb), lb)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -118,23 +277,34 @@ def _dname_rules(pz: ParsedZone, origin: dns.name.Name):
 
 def build_markers(
     base: ParsedZone, cand: ParsedZone
-) -> tuple[set[tuple[str, ...]], dict[tuple[str, ...], tuple[str, str]]]:
-    """返回 (标记名集合, 每个 trie 节点对应的一对虚拟新鲜标签)。"""
+) -> tuple[set[tuple[str, ...]], FreshPool]:
+    """返回 (标记名集合, 全局虚拟新鲜标签池)。
+
+    所有标记都保证是合法 DNS 名：真实属主来自已校验区域（天然 ≤255），
+    反向拉回产物在加入前按线长余量过滤——DNAME 属主为 63 字节长标签时，
+    自引用拉回每跳增加 64 线字节，4 跳即超 255；超限名两版里都无法被
+    任何 DNS 查询发出（``dns.name.from_text`` 直接 NameTooLong），故不
+    作为标记，其“应答”也不能作为见证。合法查询空间由此仍被有限单元
+    完备覆盖，且与 /resolve 的边界一致。
+    """
     origin = base.origin
     markers = _collect_owner_labels(base, origin) | _collect_owner_labels(cand, origin)
 
     # DNAME 拉回闭包：两版区域里任一 DNAME 规则都要作用于当前全部标记，
-    # 直到深度达到 MAX_PREIMAGE_DEPTH。这样无论变化在源侧还是目标侧，受
-    # 影响的未列名都会落进某个显式单元，而不是只被深层虚拟探针笼统覆盖。
+    # 直到深度达到 MAX_PREIMAGE_DEPTH 或线长触顶。这样无论变化在源侧
+    # 还是目标侧，受影响的未列名都会落进某个显式单元，而不是只被深层
+    # 虚拟探针笼统覆盖。
     #
-    # 关键：闭包必须**按实际跳数有限化**。像 ``x.d DNAME d`` 这类自引用
-    # 规则会把目标侧标记 d 拉成 x.d，再拉成 x.x.d……若无深度限制便无限
-    # 生成（旧实现的不动点循环在此直接挂死）。每个标记记录其“经多少跳
-    # DNAME 反向改写得到”的最短距离：属主/通配父节点为 0，每做一次拉回
-    # 距离 +1；距离已达 MAX_PREIMAGE_DEPTH 的标记不再继续拉回——由它再
-    # 拉回得到的名字正向解析时至少需要 MAX_ALIAS_HOPS 跳，必在跳数上限
-    # 处终止，两版末端数据都不可见（与 /resolve 一致），其变化与否由其
-    # 所属的 star/deep 探针空隙代表。
+    # 有限化之一（跳数）：像 ``x.d DNAME d`` 这类自引用规则会把目标侧
+    # 标记 d 拉成 x.d，再拉成 x.x.d……无深度限制便无限生成（旧实现的
+    # 不动点循环在此直接挂死）。每个标记记录“经多少跳 DNAME 反向改写
+    # 得到”的最短距离：属主/通配父节点为 0，每做一次拉回距离 +1；距离
+    # 已达 MAX_PREIMAGE_DEPTH 的标记不再继续拉回。
+    #
+    # 有限化之二（线长）：拉回产物（绝对名）超过 255 字节线格式上限时
+    # 不加入标记。它正向解析所需的查询名本身就无法在线上表达，不可能
+    # 有合法见证；其所属合法名称空间的部分由父节点的 star/deep 探针
+    # 空隙代表（空隙探针也按余量构建，见 build_cells）。
     rules = list(_dname_rules(base, origin)) + list(_dname_rules(cand, origin))
 
     # dist[m] = m 距最近 0 层标记的最短反向改写跳数。
@@ -163,31 +333,26 @@ def build_markers(
                     new = rel + owner_parent
                 else:
                     new = rel + src
-                if new not in dist:
-                    dist[new] = _depth + 1
-                    markers.add(new)
-                    new_frontier.add(new)
+                if new in dist:
+                    continue
+                if _abs_wire(new, origin) > MAX_NAME_WIRE:
+                    # 线长触顶：超长名无法查询，不作反向标记；它也不再
+                    # 作为前沿继续拉回（更深的拉回只会更长）。
+                    continue
+                dist[new] = _depth + 1
+                markers.add(new)
+                new_frontier.add(new)
         frontier = new_frontier
 
-    # trie 前缀闭合。
+    # trie 前缀闭合：合法标记的祖先标签数更少，线长必然也合法。
     for m in list(markers):
         for i in range(1, len(m)):
             markers.add(m[i:])
 
-    # 为每个 trie 节点分配一对互不冲突的虚拟标签。
-    real_labels = {lb for m in markers for lb in m if lb != "*"}
-    fresh_map: dict[tuple[str, ...], tuple[str, str]] = {}
-    i = 0
-    for node in sorted(markers, key=lambda x: (len(x), x)):
-        while f"w-{i}" in real_labels or f"ww-{i}" in real_labels:
-            i += 1
-        w, ww = f"w-{i}", f"ww-{i}"
-        real_labels.add(w)
-        real_labels.add(ww)
-        i += 1
-        fresh_map[node] = (w, ww)
-
-    return markers, fresh_map
+    # 全局虚拟新鲜标签池：避开两版区域的全部真实标签与字面 *。
+    real_labels = {lb for m in markers for lb in m}
+    pool = FreshPool(set(real_labels))
+    return markers, pool
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +368,59 @@ class Cell:
 
 def build_cells(
     markers: set[tuple[str, ...]],
-    fresh_map: dict[tuple[str, ...], tuple[str, str]],
+    pool: FreshPool,
+    origin: dns.name.Name,
 ) -> list[Cell]:
+    """为 trie 每个节点构建 exact/star/deep 单元。
+
+    探针标签按节点线长余量从全局池中**从紧到松**分配：
+
+    * 余量放不下任何一个合法标签（名字已达 254/255 字节）→ 该节点没有
+      任何合法下级名，star/deep 等价类为空，只保留精确单元；
+    * 只放得下一个一标签探针（余量 2~3 字节）→ 建 star 单元，取最短新
+      鲜标签（如 ``0``）；deep 探针需要两个标签（至少 4 字节）放不下，
+      该“多层未列名”等价类在合法名称空间里本就为空，不建单元；
+    * 余量 ≥4 → star 与 deep 单元都建，deep 的两层标签都取新鲜名。
+
+    探针名一律不截断；字面通配属主节点仍只建精确单元（其 star/deep
+    空隙在语法上不可能存在）。
+    """
+    # 按线长余量从紧到松为每个节点分配探针标签，保证最短标签优先留给
+    # 最紧的节点。标签选取在“保证 deep 等价类有见证”与“宽标签可读”间
+    # 取舍：先试探能否用一对宽标签同时放下 star 与 deep 两个探针；若
+    # 用宽 star 会撑掉 deep（而短 star 能保住 deep），就归还宽标签、
+    # 改用最短短标签；余量连两层短标签都放不下时只建 star（该多层等
+    # 价类在合法名称空间为空）。分配与单元产出分开，输出顺序不受影响。
+    allocations: dict[tuple[str, ...], tuple[str | None, str | None]] = {}
+    ordered = sorted(
+        markers,
+        key=lambda x: (_wire_room(x, origin), len(x), x),
+    )
+    for node in ordered:
+        if node and node[0] == "*":
+            allocations[node] = (None, None)
+            continue
+        room = _wire_room(node, origin)
+
+        # 试探方案 A：star、deep 都用宽标签（w-i / ww-i 风格）。
+        wide_star = pool.take_wide_preferred(room)
+        wide_deep = (
+            pool.take_wide_preferred(room - _label_wire(wide_star))
+            if wide_star is not None else None
+        )
+        if wide_star is not None and wide_deep is not None:
+            allocations[node] = (wide_star, wide_deep)
+            continue
+        # 方案 A 不完整（放不下两层宽探针，或连宽 star 都放不下）：归还，
+        # 改走方案 B——用最短短标签优先保住合法等价类的覆盖。
+        pool.release([lb for lb in (wide_star, wide_deep) if lb is not None])
+        short_star = pool.take_short_only(room)
+        short_deep = (
+            pool.take_short_only(room - _label_wire(short_star))
+            if short_star is not None else None
+        )
+        allocations[node] = (short_star, short_deep)
+
     cells: list[Cell] = []
     for node in sorted(markers, key=lambda x: (len(x), x)):
         # 字面通配属主（(*,P,...)）只建精确单元：名字 *.P 作为 P 的一标签
@@ -216,19 +432,20 @@ def build_cells(
         if node and node[0] == "*":
             cells.append(Cell("exact", node, node))
             continue
-        w, ww = fresh_map[node]
-        # 1) 精确单元。
+        star_label, deep_label = allocations[node]
+        # 1) 精确单元（节点名本身合法——它要么来自区域，要么通过了线长检查）。
         cells.append(Cell("exact", node, node))
         # 2) 一标签空隙：node 的直接下级中不属于任何标记子节点的名字
         #    （其中包含字面 * 属主；新鲜标签 w 与之同属一个等价类）。
-        cells.append(Cell("star", node, (w,) + node))
+        if star_label is not None:
+            cells.append(Cell("star", node, (star_label,) + node))
         # 3) 多层空隙：ww 开头，下面再放一层 w，代表“进入未标记子树后”
         #    的任意深度名称。
-        cells.append(Cell("deep", node, (ww, w) + node))
+        if star_label is not None and deep_label is not None:
+            cells.append(Cell("deep", node, (deep_label, star_label) + node))
     return cells
 
 
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # 应答签名（忽略 TTL；owner/rdata 全部按线上形态比较）
 # ---------------------------------------------------------------------------
@@ -289,8 +506,8 @@ def analyze(
     origin = base_pz.origin
     base_res, cand_res = Resolver(base_pz), Resolver(cand_pz)
 
-    markers, fresh_map = build_markers(base_pz, cand_pz)
-    cells = build_cells(markers, fresh_map)
+    markers, pool = build_markers(base_pz, cand_pz)
+    cells = build_cells(markers, pool, origin)
 
     diffs: list[TypeDiff] = []
     for qt in qtypes:

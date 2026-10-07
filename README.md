@@ -52,12 +52,18 @@ BIND 文本（基线 `baseline` 与候选 `candidate`），枚举**域内所有�
   `alias_chain_limit` 终止，末端数据不再可见；环以 `alias_loop` 终止。
 * **DNAME 目标子树变化影响的“未列名”会被覆盖**：目标子树里的结构点会通过
   拉回（preimage）闭包映射回 DNAME 源侧，因此新增 `a.b.dt` 之类的变化会
-  产生 `a.b.d` 等模式，而不会漏报。拉回深度**按实际跳数有限化**——一次拉回
-  对应正向解析的一跳 DNAME 改写，闭包只生成“不超过 31 跳即可到达末端结构
-  点”的源侧名称；再深的名字两版都在跳数上限处终止。这样即使区域里有
-  `x.d DNAME d` 这种**自引用 DNAME**，闭包也只生成有限个 `x.d / x.x.d /
-  … / x³¹.d` 标记（旧实现的无界不动点会在此无限生成、令 `/impact` 无响应），
-  且边界与 `/resolve` 完全一致：31 层 `x` 的变化仍上报，32 层触顶后不报。
+  产生 `a.b.d` 等模式，而不会漏报。拉回深度**按实际可达性有限化**：一次
+  拉回对应正向解析的一跳 DNAME 改写，闭包只生成“不超过 31 跳即可到达
+  末端结构点”的源侧名称；再深的名字两版都在跳数上限处终止。此外拉回
+  产物（及探针）必须是合法 DNS 名（绝对名 ≤255 线字节）——长标签
+  DNAME 属主（最长 63 字节）的自引用规则每跳加一个长标签，超线长的名字
+  任何查询都发不出去，不作标记也不作见证；空隙探针按节点线长余量取
+  `w-i` 或最短的一字符新鲜标签，名字永不截断。这样即使区域里有
+  `x.d DNAME d` 这种**自引用 DNAME**，闭包也只生成有限个
+  `x.d / x.x.d / … / x³¹.d` 标记（旧实现的无界不动点会在此无限生成、令
+  `/impact` 无响应），且边界与 `/resolve` 完全一致：31 层 `x` 的变化仍
+  上报，32 层触顶后不报；若每层是 63 字节长标签，则线长先触顶，只覆盖
+  0–3 跳的合法名，第 4 跳（>255 字节）不可查询。
 
 ### 变更模式选择子（selector）
 
@@ -70,8 +76,9 @@ BIND 文本（基线 `baseline` 与候选 `candidate`），枚举**域内所有�
 
 > 模式内任一 `(名称, 类型)` 的两版应答都不同；模式外任一名称都相同。
 
-无限名称空间由“两版区域的标记名 trie + 每节点一对虚拟新鲜标签（`w-*`、
-`ww-*`）”有限化，因此覆盖率可证明、可回归测试。
+无限名称空间由“两版区域的标记名 trie + 每节点一对虚拟新鲜标签（余量
+受限时自动改用最短的一字符新鲜标签，且全部探针名 ≤255 线字节）”
+有限化，因此覆盖率可证明、可回归测试。
 
 ---
 
@@ -812,6 +819,107 @@ DNAME”，**没有**末端 A，因此 `identical` 为 `true`，该名字不属�
 * 非法语法、越区属主、外部 CNAME/NS/DNAME 目标等仍按整单 `400` 拒绝，
   与区域是否含自引用 DNAME 无关。
 
+### 长标签自引用 DNAME：255 字节线格式上限优先于 32 跳边界
+
+反向拉回闭包受**两重**有限化：除上面的跳数上限（31）外，每个拉回产物
+（及其探针）还必须是**合法 DNS 名**——绝对名线格式不超过 255 字节
+（RFC 1035；单个标签最长 63 字节）。设 `L` 为 63 个 `x`，区域含
+`L.d DNAME d`（每跳正向改写把一个 64 线字节的长标签加到名字左侧）：
+
+* `a.Lᵏ.d` 在线上的长度为 `2 + 64k + 2 + 9`（`a`、每个 `L.`、`d`、
+  origin `example.`），即 k=0/1/2/3 对应 **13/77/141/205** 字节，全部
+  合法；k=4 已达 269 字节，**任何 DNS 查询都发不出去**
+  （`dns.name.from_text` 直接 `NameTooLong`，`/resolve` 返回
+  `400 invalid_name`）。
+* 因此 `/impact` 对该场景**恰好**产出 4 个精确模式（0–3 跳），模式集合
+  与 `/resolve` 在全部**合法**名称上的判定互斥完备；超长名既不作标记
+  也不作见证——不是“漏报”，而是那个名字本就不可能被查询。短标签
+  （如 `x.d DNAME d`）场景下线长远不触顶，边界仍是 31/32 跳（32 个
+  模式），二者各自由先到达的上限截断。
+* 探针标签按节点的**线长余量**从全局新鲜标签池分配：余量充裕时仍是
+  可读的 `w-i` / `ww-i`（故短标签场景的 `probe_cells_per_type` 仍为
+  201）；当某个标记名只剩 2~3 字节余量、放得下一字符短标签却放不下
+  4 字节的 `w-0` 时，改取最短的未列名新鲜标签（如 `0`）作见证；名字
+  已到 254/255 字节、一个合法下级标签都放不下时，该 star/deep 空隙
+  等价类在合法名称空间里为空，不建单元。**名称永不截断，合法查询不
+  遗漏。**
+
+请求（两版都含 `L.d DNAME d`，`L` 为 63 个 `x`，仅 `a.d` 的 A 不同）：
+
+```bash
+L=$(printf 'x%.0s' $(seq 1 63))
+curl -sS http://localhost:8080/impact \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"origin\": \"example.\",
+    \"types\": [\"A\"],
+    \"baseline\": \"\$ORIGIN example.\n\$TTL 3600\n@ SOA ns1 hm 1 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\n${L}.d DNAME d\na.d A 192.0.2.10\n\",
+    \"candidate\": \"\$ORIGIN example.\n\$TTL 3600\n@ SOA ns1 hm 2 7200 3600 1209600 60\n NS ns1\nns1 A 192.0.2.1\n${L}.d DNAME d\na.d A 192.0.2.20\n\"
+  }'
+```
+
+真实响应（头部 + 四个模式的摘要；见证应答与 `/resolve` 逐字段相同，
+完整长链与短标签场景同构，仅 `x` 标签换成 63 个 `x`）：
+
+```json
+{
+  "origin": "example.",
+  "compared_types": ["A"],
+  "coverage": {
+    "probe_cells_per_type": 30,
+    "changed_cells_total": 4,
+    "note": "probe_cells_per_type 个等价类覆盖域内全部名称；每个模式的 scope 减去 exclude 后两两互斥且并集恰为变更集。"
+  },
+  "type_summary": [ { "type": "A", "changed_cells": 4, "patterns": 4 } ],
+  "patterns": [
+    { "scope": { "selector": "a.L.L.L.d", "kind": "exact",
+                 "name": "a.L.L.L.d" },
+      "exclude": [],
+      "witness": { "name": "a.L.L.L.d", "probe_kind": "exact" },
+      "baseline":   { "termination": "exact",
+        "answer": [ { "name": "a.L.L.L.d", "type": "CNAME",
+                      "records": [ { "target": "a.L.L.d.example." } ] },
+                    { "name": "L.d", "type": "DNAME",
+                      "records": [ { "target": "d.example." } ] },
+                    "... 第 2、3 跳的合成 CNAME/DNAME（略） ...",
+                    { "name": "a.d", "type": "A",
+                      "records": [ { "address": "192.0.2.10" } ] } ],
+        "dname_encloser": "L.d",
+        "alias_chain": [ "... 共 3 个 DNAME 跳 ..." ] },
+      "candidate":  { "termination": "exact", "...": "...",
+        "answer_last": { "name": "a.d", "type": "A",
+                         "records": [ { "address": "192.0.2.20" } ] } } },
+    { "scope": { "selector": "a.L.L.d", "kind": "exact", "...": "..." },
+      "...": "... 2 跳，结构同上，末端 A .10/.20 ..." },
+    { "scope": { "selector": "a.L.d", "kind": "exact", "...": "..." },
+      "...": "... 1 跳，结构同上，末端 A .10/.20 ..." },
+    { "scope": { "selector": "a.d", "kind": "exact", "name": "a.d" },
+      "exclude": [],
+      "witness": { "name": "a.d", "probe_kind": "exact" },
+      "baseline":  { "termination": "exact",
+        "answer": [ { "name": "a.d", "type": "A", "ttl": 3600,
+                      "records": [ { "address": "192.0.2.10" } ] } ],
+        "authority": [], "additional": [], "wildcard_source": null,
+        "dname_encloser": null, "alias_chain": [] },
+      "candidate": { "termination": "exact",
+        "answer": [ { "name": "a.d", "type": "A", "ttl": 3600,
+                      "records": [ { "address": "192.0.2.20" } ] } ],
+        "authority": [], "additional": [], "wildcard_source": null,
+        "dname_encloser": null, "alias_chain": [] } }
+  ]
+}
+```
+
+（上面 JSON 中的 `L` 代表 63 个 `x`、`"..."` 为本文档折叠；实际响应
+完整展开、无这些键。见证名的真实线长分别为 205/141/77/13 字节，首个
+合成 CNAME 的 target 依次为 141/77/13/— 字节，全部 ≤255。）
+
+用 `/resolve` 核对边界：3 层 `L`（205 字节）仍 `identical=false`、3 跳
+`exact` 取到末端不同的 A；4 层 `L`（269 字节）查询名非法，直接
+`400 invalid_name`，与 `/impact` 不产出该见证一致。线长余量受限的标记
+节点（如一个 253 字节的节点，其 `*.节点` 恰为 255 字节）上的空隙探针
+会改用一字符新鲜标签（如 `0.节点`，255 字节）见证，测试中有断言。
+
 
 ### 委派 / 通配 / DNAME 的应答长什么样
 
@@ -897,7 +1005,7 @@ curl -sS http://localhost:8080/resolve \
 app/
   zone.py       # BIND 逐记录解析 + 越区/外部引用/委派校验；构建空非终结点/通配父节点集合
   resolver.py   # 离线权威解析：切点、最近包围名（含 ENT/通配父）、通配与 DNAME 合成、别名逐跳
-  diff.py       # 标记 trie、按跳数有限化的 DNAME 拉回闭包（上限 31 跳）、探针分区、未列名空洞排除与互斥完备模式归并
+  diff.py       # 标记 trie、按跳数与 255 字节线长双重有限化的 DNAME 拉回闭包、按线长余量取最短新鲜标签的探针分区、未列名空洞排除与互斥完备模式归并
   serial.py     # Answer / Pattern 的 JSON 序列化
   main.py       # FastAPI：POST /impact、POST /resolve、GET /healthz
 tests/
@@ -916,4 +1024,6 @@ PYTHONPATH=. python3 tests/test_engine.py     # 或：pytest -q
 
 测试含数千个随机名称的性质校验：**变化名恰好落入一个模式、未变化名不落
 入任何模式、模式之间互不重叠**，并覆盖通配 / DNAME（含目标子树未列名）/
-ENT / 委派 / 别名环等情形。
+ENT / 委派 / 别名环等情形；另有 63 字节长标签自引用 DNAME 的专项回归：
+标记与探针全部 ≤255 线字节、模式恰为合法的 0–3 跳四个、见证与
+`/resolve` 逐字段一致、269 字节的第 4 跳名被 `invalid_name` 拒绝。

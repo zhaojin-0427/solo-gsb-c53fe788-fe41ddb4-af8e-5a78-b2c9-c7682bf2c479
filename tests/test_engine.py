@@ -7,6 +7,7 @@ import random
 
 import dns.name
 import dns.rdatatype
+import pytest
 
 from app.zone import parse_zone, ZoneError
 from app.resolver import Resolver
@@ -529,6 +530,132 @@ def test_self_dname_only_present_in_candidate_is_finite_and_sound():
     )
 
 
+# --------------------------------------- 63 字节长标签 DNAME：线长有限化
+
+LONG = "x" * 63
+
+LONG_DNAME_HDR = (
+    "$ORIGIN ex.\n$TTL 60\n"
+    "@ SOA ns hm {sn} 1 1 1 1\n NS ns\n"
+    "ns A 192.0.2.1\n"
+    f"{LONG}.d DNAME d\n"
+)
+
+
+def _long_dname_pair(a1="192.0.2.10", a2="192.0.2.20"):
+    b = parse_zone(
+        LONG_DNAME_HDR.format(sn=1) + f"a.d A {a1}\n", ORIGIN, label="b")
+    c = parse_zone(
+        LONG_DNAME_HDR.format(sn=2) + f"a.d A {a2}\n", ORIGIN, label="c")
+    return b, c
+
+
+def test_long_label_self_dname_markers_wire_bounded():
+    # 回归：L=63 个 x 时，旧闭包按 31 跳拉回会造出 2050 字节的名字，
+    # build_cells 拼接 w-N 探针时 dns.name 抛 NameTooLong，POST /impact
+    # 直接 500。修复后反向标记与全部探针都必须是 ≤255 字节的合法名。
+    from app.diff import _abs_wire
+    b, c = _long_dname_pair()
+    markers, pool = build_markers(b, c)
+    assert all(_abs_wire(m, b.origin) <= 255 for m in markers)
+    from app.diff import build_cells
+    cells = build_cells(markers, pool, b.origin)
+    assert all(_abs_wire(cl.probe, b.origin) <= 255 for cl in cells)
+
+    # 自引用规则每跳加 64 线字节：a.L^k.d 合法的只有 k=0..3
+    # （origin ex. 占 4 字节：8/72/136/200），k=4 达 264 字节，无法查询。
+    for k in range(4):
+        assert ("a",) + (LONG,) * k + ("d",) in markers
+    assert ("a",) + (LONG,) * 4 + ("d",) not in markers
+    assert (LONG,) * 4 + ("d",) not in markers
+
+    # 32 跳跳数上限仍在（只是本场景先被线长截断）。
+    assert ("x",) * (MAX_ALIAS_HOPS + 5) + ("d",) not in markers
+
+    with pytest.raises(dns.name.NameTooLong):
+        dns.name.from_text("a." + (LONG + ".") * 4 + "d", origin=b.origin)
+
+
+def test_long_label_self_dname_patterns_and_resolve_parity():
+    # /impact 与 /resolve 互斥完备：恰为 k=0..3 四个精确模式，见证合法，
+    # 逐字段与解析器一致；k=4 无法查询，不产生见证。
+    b, c = _long_dname_pair()
+    rb, rc = Resolver(b), Resolver(c)
+    qt = dns.rdatatype.A
+    patterns = analyze(b, c, [qt])[0].patterns
+    expect = {"a." + (LONG + ".") * k + "d" for k in range(4)}
+    assert {p.scope.render() for p in patterns} == expect
+    assert len(patterns) == 4
+    for p in patterns:
+        assert len(p.witness.to_wire()) <= 255
+        assert answer_signature(p.baseline) == answer_signature(
+            rb.resolve(p.witness, qt))
+        assert answer_signature(p.candidate) == answer_signature(
+            rc.resolve(p.witness, qt))
+    # 末端 A 可见且不同；跳数等于长标签层数。
+    by_hops = {len(p.baseline.hops): p for p in patterns}
+    assert set(by_hops) == {0, 1, 2, 3}
+    assert by_hops[3].candidate.termination == "exact"
+    assert by_hops[3].candidate.answer[-1].rdata.address == "192.0.2.20"
+
+
+def test_long_label_self_dname_patterns_sound():
+    b, c = _long_dname_pair()
+    assert_sound(
+        b, c, "A",
+        ["a", "d", LONG, "ns", "hm", "y", "z", "foo",
+         "*", "0", "1", "w-0", "ww-0", "00"],
+        rounds=4000,
+    )
+
+
+def test_tight_headroom_star_uses_short_fresh_label():
+    # 标记节点 N 占 253 线字节（origin example. 占 9）：余 2 字节，放得下
+    # 一字符短标签（探针 255），却放不下 4 字节的 w-0；deep 探针要两个
+    # 标签（≥4 字节）更放不下——此时须取短新鲜标签作见证，不截断名字，
+    # deep 等价类（两层下级）在合法名称空间为空，不建单元。
+    from app.diff import build_cells, _abs_wire
+    X = "x" * 63
+    T = "t" * 51
+    n_name = f"{T}.{X}.{X}.{X}"
+    star_name = f"*.{n_name}"
+    # *.N 恰好 255 字节，可配置；候选版新增该通配后一标签空隙发生变化。
+    assert len(dns.name.from_text(star_name,
+           origin=dns.name.from_text("example.")).to_wire()) == 255
+    hdr = ("$ORIGIN example.\n$TTL 60\n"
+           "@ SOA ns hm {sn} 1 1 1 1\n NS ns\nns A 192.0.2.1\n")
+    b = parse_zone(hdr.format(sn=1) + f"{n_name} A 192.0.2.9\n",
+                   "example.", label="b")
+    c = parse_zone(
+        hdr.format(sn=2) + f"{n_name} A 192.0.2.9\n{star_name} A 192.0.2.10\n",
+        "example.", label="c")
+    markers, pool = build_markers(b, c)
+    n_rel = rel_labels(dns.name.from_text(n_name, origin=b.origin), b.origin)
+    assert _abs_wire(n_rel, b.origin) == 253
+    cells = build_cells(markers, pool, b.origin)
+    star_cells = [cl for cl in cells if cl.kind == "star"
+                  and cl.labels == n_rel]
+    deep_cells = [cl for cl in cells if cl.kind == "deep"
+                  and cl.labels == n_rel]
+    assert len(star_cells) == 1 and deep_cells == []
+    probe_label = star_cells[0].probe[0]
+    assert len(probe_label) == 1          # 一字符短新鲜标签
+    assert probe_label not in {"x", "t", "*"}  # 不与真实标签冲突
+    assert _abs_wire(star_cells[0].probe, b.origin) == 255
+
+    qt = dns.rdatatype.A
+    patterns = analyze(b, c, [qt])[0].patterns
+    star_pat = next(p for p in patterns if p.scope.kind == "star"
+                    and p.scope.labels == n_rel)
+    assert len(star_pat.witness.to_wire()) == 255
+    rb, rc = Resolver(b), Resolver(c)
+    assert answer_signature(star_pat.baseline) == answer_signature(
+        rb.resolve(star_pat.witness, qt))
+    assert answer_signature(star_pat.candidate) == answer_signature(
+        rc.resolve(star_pat.witness, qt))
+    assert star_pat.candidate.termination == "wildcard_expansion"
+
+
 
 # ---------------------------------------------------------------- HTTP 端到端
 
@@ -602,6 +729,75 @@ def test_http_impact_self_dname_scenario():
     })
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "out_of_zone"
+
+
+def test_http_impact_long_label_self_dname_scenario():
+    # POST /impact 在 63 字节长标签自引用 DNAME 场景下必须正常返回
+    # （旧实现因探针 NameTooLong 而 500）；模式与 /resolve 一致，恰为
+    # 0..3 跳四个；第 4 跳名称超 255 字节不可查询、不作见证；非法区域
+    # 仍整单 400。
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    L = "x" * 63
+    client = TestClient(app)
+    body = {
+        "origin": "example.",
+        "types": ["A"],
+        "baseline": (
+            "$ORIGIN example.\n$TTL 3600\n"
+            "@ SOA ns1 hm 1 7200 3600 1209600 60\n NS ns1\n"
+            f"ns1 A 192.0.2.1\n{L}.d DNAME d\na.d A 192.0.2.10\n"
+        ),
+        "candidate": (
+            "$ORIGIN example.\n$TTL 3600\n"
+            "@ SOA ns1 hm 2 7200 3600 1209600 60\n NS ns1\n"
+            f"ns1 A 192.0.2.1\n{L}.d DNAME d\na.d A 192.0.2.20\n"
+        ),
+    }
+    r = client.post("/impact", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["type_summary"] == [
+        {"type": "A", "changed_cells": 4, "patterns": 4}]
+    patterns = out["patterns"]
+    assert {p["scope"]["selector"] for p in patterns} == {
+        "a." + (L + ".") * k + "d" for k in range(4)
+    }
+    for p in patterns:
+        assert len(dns.name.from_text(
+            p["witness"]["name"], origin=dns.name.from_text("example.")
+        ).to_wire()) <= 255
+
+    # 每个见证都与 /resolve 逐字段一致。
+    for p in patterns:
+        name = p["scope"]["selector"]
+        rr = client.post("/resolve", json={
+            "origin": "example.", "name": name, "type": "A",
+            "baseline": body["baseline"], "candidate": body["candidate"],
+        })
+        assert rr.status_code == 200
+        ro = rr.json()
+        assert ro["identical"] is False
+        assert p["baseline"] == ro["baseline"]
+        assert p["candidate"] == ro["candidate"]
+
+    # 4 层长标签（269 字节）：查询名本身非法 → 400 invalid_name，
+    # 且不产生任何模式（超长名不作见证）。
+    name4 = "a." + (L + ".") * 4 + "d"
+    rr = client.post("/resolve", json={
+        "origin": "example.", "name": name4, "type": "A",
+        "baseline": body["baseline"], "candidate": body["candidate"],
+    })
+    assert rr.status_code == 400
+    assert rr.json()["error"]["code"] == "invalid_name"
+    assert all(p["scope"]["selector"] != name4 for p in patterns)
+
+    # 非法区域（外部 CNAME 目标）依旧整单 400。
+    bad = dict(body, baseline=body["baseline"] + "www CNAME ext.out.\n")
+    r = client.post("/impact", json=bad)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_zone"
 
 
 if __name__ == "__main__":
